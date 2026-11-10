@@ -1,7 +1,7 @@
 #!/bin/sh
 # drawer installer
 #
-#   curl -fsSL https://raw.githubusercontent.com/nvrma/drawer/main/install.sh | sh
+#   curl -fsSL https://nakulv.com/drawer/install.sh | sh
 #
 # Downloads the latest prebuilt binary for your OS/CPU from GitHub Releases,
 # verifies its SHA-256 checksum, and installs it to ~/.local/bin (no sudo).

@@ -8,6 +8,8 @@
 [![Release](https://img.shields.io/github/v/release/nvrma/drawer?sort=semver)](https://github.com/nvrma/drawer/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+[**Website & docs**](https://nakulv.com/drawer/) · [Releases](https://github.com/nvrma/drawer/releases) · [Changelog](CHANGELOG.md)
+
 <img src="docs/screenshot.png" alt="drawer: machines on the left, a live shell in the middle, the machine's files on the right" width="900">
 
 </div>
@@ -17,7 +19,7 @@ drawer is a fast, keyboard-driven terminal app for the machines you SSH into eve
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/nvrma/drawer/main/install.sh | sh
+curl -fsSL https://nakulv.com/drawer/install.sh | sh
 ```
 
 The script:
