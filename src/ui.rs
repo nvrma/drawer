@@ -1,6 +1,7 @@
 //! Rendering. Oak cabinet, catalog-card panes, brass only on what you can act on.
 
 use chrono::{Local, NaiveDate, TimeZone};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
@@ -10,15 +11,18 @@ use ratatui::widgets::{Block, Clear, Paragraph, Widget, Wrap};
 use tui_term::widget::{Cursor, PseudoTerminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, FORM_HINTS, FORM_LABELS, Focus, Panes, Popup, Tone, Transfer};
+use crate::app::{
+    App, FORM_HINTS, FORM_LABELS, Focus, Forwards, Hit, NameInput, NameOp, PREVIEW_LIMIT, Panes, Popup, Preview,
+    PreviewBody, Tone, Transfer,
+};
 use crate::download;
-use crate::remote::Kind;
-use crate::session::State;
+use crate::remote::{self, Forward, Kind};
+use crate::session::{Sort, State};
 use crate::theme::*;
 
 // ------------------------------------------------------------------ layout
 
-pub fn layout(area: Rect, focus: Focus) -> Panes {
+pub fn layout(area: Rect, focus: Focus, zoom: bool) -> Panes {
     let mut p = Panes::default();
     if area.width < 60 || area.height < 14 {
         p.too_small = true;
@@ -26,6 +30,12 @@ pub fn layout(area: Rect, focus: Focus) -> Panes {
     }
     let body_h = area.height - 1;
     p.footer = Rect::new(area.x, area.y + body_h, area.width, 1);
+    if zoom {
+        // alt+z: the shell takes the whole window.
+        p.machines = Rect::new(area.x, area.y, 0, body_h);
+        p.shell = Some(Rect::new(area.x, area.y, area.width, body_h));
+        return p;
+    }
     let w = area.width;
     let side = if w >= 110 { 28 } else { 24 };
     p.machines = Rect::new(area.x, area.y, side, body_h);
@@ -214,6 +224,53 @@ fn key_hint(k: &str, label: &str) -> Vec<Span<'static>> {
     ]
 }
 
+/// The key a hint label stands for, so clicking the hint can press it.
+pub fn hint_key(k: &str) -> Option<KeyEvent> {
+    let (mods, rest) = if let Some(r) = k.strip_prefix("alt+") {
+        (KeyModifiers::ALT, r)
+    } else if let Some(r) = k.strip_prefix("ctrl+") {
+        (KeyModifiers::CONTROL, r)
+    } else {
+        (KeyModifiers::NONE, k)
+    };
+    let code = match rest {
+        "enter" => KeyCode::Enter,
+        "esc" => KeyCode::Esc,
+        "tab" => KeyCode::Tab,
+        "pgup" => KeyCode::PageUp,
+        "pgdn" => KeyCode::PageDown,
+        "del" => KeyCode::Delete,
+        s if s.chars().count() == 1 => KeyCode::Char(s.chars().next()?),
+        _ => return None,
+    };
+    let mods =
+        if matches!(code, KeyCode::Char(c) if c.is_ascii_uppercase()) { mods | KeyModifiers::SHIFT } else { mods };
+    Some(KeyEvent::new(code, mods))
+}
+
+/// A popup's action row: `key label` pairs 5 columns apart, each clickable.
+fn actions(buf: &mut Buffer, app: &App, x: u16, y: u16, w: u16, items: &[(&str, &str, Color)]) {
+    let mut cx = x;
+    for (i, (k, l, c)) in items.iter().enumerate() {
+        if i > 0 {
+            cx += 5;
+        }
+        // A faint key can't act right now: faint italic label, no brass.
+        let label = if *c == FAINT { meta() } else { st(GRAIN) };
+        let key = if *c == FAINT { st(FAINT) } else { st(*c).add_modifier(Modifier::BOLD) };
+        let line = Line::from(vec![Span::styled(k.to_string(), key), Span::styled(format!(" {l}"), label)]);
+        let lw = line.width() as u16;
+        if cx + lw > x + w {
+            break;
+        }
+        put(buf, cx, y, line, lw);
+        if let Some(ev) = hint_key(k) {
+            app.hit(Rect::new(cx, y, lw, 1), Hit::Key(ev));
+        }
+        cx += lw;
+    }
+}
+
 fn hints(pairs: &[(&str, &str)]) -> Line<'static> {
     let mut spans = Vec::new();
     for (i, (k, l)) in pairs.iter().enumerate() {
@@ -228,6 +285,7 @@ fn hints(pairs: &[(&str, &str)]) -> Line<'static> {
 // -------------------------------------------------------------------- draw
 
 pub fn draw(f: &mut Frame, app: &App) {
+    app.hits.borrow_mut().clear();
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(OAK).fg(IVORY)), area);
     let p = app.panes;
@@ -241,7 +299,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         f.render_widget(msg, Rect::new(area.x, area.y + y.saturating_sub(1), area.width, 2));
         return;
     }
-    draw_machines(f.buffer_mut(), p.machines, app);
+    if p.machines.width > 0 {
+        draw_machines(f.buffer_mut(), p.machines, app);
+    }
     if let Some(r) = p.shell {
         draw_shell(f, r, app);
     }
@@ -321,6 +381,7 @@ fn draw_machines(buf: &mut Buffer, area: Rect, app: &App) {
         if sel {
             fill(buf, Rect::new(inner.x, y, inner.width, 2), ROW_SEL);
         }
+        app.hit(Rect::new(inner.x, y, inner.width, 2.min(inner.bottom().saturating_sub(y))), Hit::Machine(i));
         let session = app.sessions.get(&h.alias);
         let (glyph, gstyle) = match session.map(|s| &s.state) {
             Some(State::Connected) => ("●", st(OK)),
@@ -394,10 +455,20 @@ fn draw_shell(f: &mut Frame, area: Rect, app: &App) {
         }
         None => title.push(Span::styled(tracked("shell"), title_style(focused))),
     }
-    let right = match session {
-        Some(s) if s.scroll > 0 => vec![Span::styled(format!("↑ {} lines", s.scroll), st(GRAIN))],
-        _ => vec![],
-    };
+    let mut right = Vec::new();
+    if let Some(s) = session {
+        if !s.forwards.is_empty() {
+            let ports: Vec<String> = s.forwards.iter().map(|f| format!(":{}", f.port())).collect();
+            right.push(Span::styled(format!("↔ {}", ports.join(" ")), st(GRAIN)));
+        }
+        let back = s.scrollback();
+        if back > 0 {
+            if !right.is_empty() {
+                right.push(Span::styled("  ·  ", st(FAINT)));
+            }
+            right.push(Span::styled(format!("↑ {back} line{}", if back == 1 { "" } else { "s" }), st(GRAIN)));
+        }
+    }
     let inner = frame(f.buffer_mut(), area, focused, title, right);
 
     let Some(h) = host else {
@@ -440,7 +511,19 @@ fn draw_shell(f: &mut Frame, area: Rect, app: &App) {
                 }
             }
         }
-        if focused && s.is_live() && s.scroll == 0 && !screen.hide_cursor() {
+        // Mouse selection: the theme's selection grey under default text.
+        if let Some(sel) = app.selection.as_ref().filter(|sel| sel.alias == s.alias) {
+            for row in 0..inner.height {
+                for col in 0..inner.width {
+                    if sel.contains(row, col) {
+                        let c = &mut buf[(inner.x + col, inner.y + row)];
+                        c.set_bg(ROW_SEL).set_fg(IVORY);
+                        c.modifier.remove(Modifier::REVERSED | Modifier::DIM);
+                    }
+                }
+            }
+        }
+        if focused && s.is_live() && screen.scrollback() == 0 && !screen.hide_cursor() {
             let (row, col) = screen.cursor_position();
             if row < inner.height && col < inner.width {
                 f.set_cursor_position((inner.x + col, inner.y + row));
@@ -450,21 +533,27 @@ fn draw_shell(f: &mut Frame, area: Rect, app: &App) {
 
     if !s.is_live() {
         let failed = matches!(s.state, State::Failed(_));
-        let mut spans = vec![Span::styled(
+        let msg = Line::styled(
             if failed { " Couldn't connect. " } else { " Session ended. " },
             st(if failed { ERR } else { IVORY }).add_modifier(Modifier::BOLD),
-        )];
-        spans.push(Span::raw("  "));
-        spans.extend(key_hint("enter", if failed { "try again" } else { "reconnect" }));
-        spans.push(Span::raw("   "));
-        spans.extend(key_hint("x", "close"));
+        );
         let bar = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
         let buf = f.buffer_mut();
         fill(buf, bar, CARD);
         for x in bar.left()..bar.right() {
             buf[(x, bar.y)].set_symbol(" ");
         }
-        put(buf, bar.x, bar.y, Line::from(spans), bar.width);
+        let mw = msg.width() as u16;
+        put(buf, bar.x, bar.y, msg, bar.width);
+        let again = if failed { "try again" } else { "reconnect" };
+        actions(
+            buf,
+            app,
+            bar.x + mw + 2,
+            bar.y,
+            bar.width.saturating_sub(mw + 2),
+            &[("enter", again, BRASS), ("x", "close", BRASS)],
+        );
     }
 }
 
@@ -537,6 +626,8 @@ fn draw_files(buf: &mut Buffer, area: Rect, app: &App) {
             .render(Rect::new(list.x + 1, list.y, list.width.saturating_sub(2), list.height), buf);
     } else if files.loading && files.entries.is_empty() {
         put(buf, list.x + 1, list.y, Line::styled("Reading…", st(GRAIN)), list.width - 1);
+    } else if visible.is_empty() && !files.filter.is_empty() {
+        put(buf, list.x + 1, list.y, Line::styled("Nothing matches.", st(GRAIN)), list.width - 1);
     } else if visible.is_empty() {
         put(buf, list.x + 1, list.y, Line::styled("This folder is empty.", st(GRAIN)), list.width - 1);
     } else {
@@ -558,6 +649,7 @@ fn draw_files(buf: &mut Buffer, area: Rect, app: &App) {
             if sel {
                 fill(buf, Rect::new(list.x, y, list.width, 1), ROW_SEL);
             }
+            app.hit(Rect::new(list.x, y, list.width, 1), Hit::File(i));
             let (icon, mut name_style) = match e.kind {
                 Kind::Dir => (icons.folder, st(IVORY).add_modifier(Modifier::BOLD)),
                 Kind::LinkDir => (icons.link, st(IVORY).add_modifier(Modifier::BOLD | Modifier::ITALIC)),
@@ -600,41 +692,92 @@ fn draw_files(buf: &mut Buffer, area: Rect, app: &App) {
         }
     }
 
-    let hidden = files.hidden_count();
-    let mut status =
-        vec![Span::styled(format!("{} item{}", visible.len(), if visible.len() == 1 { "" } else { "s" }), st(FAINT))];
-    if hidden > 0 {
-        status.push(Span::styled(format!(" · {hidden} hidden "), st(FAINT)));
-        status.push(Span::styled(".", st(BRASS).add_modifier(Modifier::BOLD)));
-    }
-    if files.loading && !files.entries.is_empty() {
-        status.push(Span::styled(" · reading…", st(FAINT)));
-    }
+    // Status row; while filtering it becomes the filter's input line.
+    let status = if files.filtering || !files.filter.is_empty() {
+        let mut spans = vec![
+            Span::styled("/ ", st(BRASS).add_modifier(Modifier::BOLD)),
+            Span::styled(clip_left(&files.filter, w.saturating_sub(16)), st(IVORY)),
+        ];
+        if files.filtering {
+            spans.push(Span::styled("▏", st(BRASS)));
+        }
+        spans.push(Span::styled(format!("  {} found", visible.len()), meta()));
+        spans
+    } else {
+        let hidden = files.hidden_count();
+        let mut spans = vec![Span::styled(
+            format!("{} item{}", visible.len(), if visible.len() == 1 { "" } else { "s" }),
+            st(FAINT),
+        )];
+        if hidden > 0 {
+            spans.push(Span::styled(format!(" · {hidden} hidden "), st(FAINT)));
+            spans.push(Span::styled(".", st(BRASS).add_modifier(Modifier::BOLD)));
+        }
+        if files.sort != Sort::Name {
+            spans.push(Span::styled(format!(" · {} first", files.sort.label()), st(FAINT)));
+        }
+        if files.loading && !files.entries.is_empty() {
+            spans.push(Span::styled(" · reading…", st(FAINT)));
+        }
+        spans
+    };
     put(buf, inner.x + 1, inner.bottom() - 1, Line::from(status), inner.width - 1);
 }
 
 fn draw_footer(buf: &mut Buffer, area: Rect, app: &App) {
-    let live = app.current_session().is_some_and(|s| s.is_live());
+    let session = app.current_session();
+    let live = session.is_some_and(|s| s.is_live());
+    let scrolled = session.is_some_and(|s| s.scrollback() > 0);
+    let filtering = session.is_some_and(|s| s.files.filtering);
+    let connected = session.is_some_and(|s| s.state == State::Connected);
     let pairs: &[(&str, &str)] = match app.focus {
         Focus::Machines if app.hosts.is_empty() => &[("a", "add"), ("r", "reload"), ("?", "help"), ("q", "quit")],
         Focus::Machines if app.searching => &[("enter", "connect"), ("esc", "clear"), ("↑↓", "move")],
+        Focus::Machines if connected => &[
+            ("enter", "shell"),
+            ("f", "forward port"),
+            ("K", "copy key"),
+            ("x", "disconnect"),
+            ("a", "add"),
+            ("e", "edit"),
+            ("/", "search"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
         Focus::Machines => &[
             ("enter", "connect"),
             ("a", "add"),
             ("e", "edit"),
             ("D", "delete"),
-            ("K", "copy key"),
             ("/", "search"),
             ("?", "help"),
             ("q", "quit"),
         ],
-        Focus::Shell if live => {
-            &[("alt+1", "machines"), ("alt+3", "files"), ("shift+pgup", "scroll back"), ("alt+q", "quit")]
+        Focus::Shell if scrolled => {
+            &[("esc", "back to live"), ("↑↓", "line"), ("pgup", "page up"), ("pgdn", "page down"), ("wheel", "scroll")]
         }
+        Focus::Shell if live && app.zoom => {
+            &[("alt+z", "unzoom"), ("alt+pgup", "scroll back"), ("alt+1", "machines"), ("alt+q", "quit")]
+        }
+        Focus::Shell if live => &[
+            ("alt+1", "machines"),
+            ("alt+3", "files"),
+            ("alt+z", "zoom"),
+            ("alt+pgup", "scroll back"),
+            ("alt+q", "quit"),
+        ],
         Focus::Shell => &[("enter", "connect"), ("tab", "next pane"), ("?", "help"), ("q", "quit")],
-        Focus::Files => {
-            &[("enter", "open"), ("h", "back"), ("d", "download"), ("u", "upload"), (".", "hidden"), ("?", "help")]
-        }
+        Focus::Files if filtering => &[("enter", "keep filter"), ("esc", "clear"), ("↑↓", "move")],
+        Focus::Files => &[
+            ("enter", "open"),
+            ("h", "back"),
+            ("d", "download"),
+            ("u", "upload"),
+            ("/", "filter"),
+            ("n", "new folder"),
+            ("s", "sort"),
+            ("?", "help"),
+        ],
     };
     // `d` only gets brass when the selected entry can actually be downloaded.
     let can_download = app
@@ -673,12 +816,17 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App) {
     let mut left = vec![Span::raw(" ")];
     let mut used = 1;
     for (i, g) in groups.into_iter().enumerate() {
-        let gw: usize = g.iter().map(|s| s.width()).sum::<usize>() + if i > 0 { gap } else { 0 };
+        let w: usize = g.iter().map(|s| s.width()).sum();
+        let gw = w + if i > 0 { gap } else { 0 };
         if used + gw + right_w > area.width as usize {
             break;
         }
         if i > 0 {
             left.push(Span::raw(" ".repeat(gap)));
+        }
+        // Clicking a hint presses its key.
+        if let Some(ev) = hint_key(pairs[i].0) {
+            app.hit(Rect::new(area.x + (used + gw - w) as u16, area.y, w as u16, 1), Hit::Key(ev));
         }
         left.extend(g);
         used += gw;
@@ -696,10 +844,11 @@ fn pct(t: &Transfer) -> u64 {
 
 // ------------------------------------------------------------------ popups
 
-fn card(f: &mut Frame, area: Rect, w: u16, h: u16, title: &str) -> Rect {
+fn card(f: &mut Frame, app: &App, area: Rect, w: u16, h: u16, title: &str) -> Rect {
     let w = w.min(area.width.saturating_sub(4));
     let h = h.min(area.height.saturating_sub(2));
     let r = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
+    app.hit(r, Hit::Card);
     f.render_widget(Clear, r);
     let buf = f.buffer_mut();
     let block = Block::bordered().border_style(st(RULE)).style(Style::new().bg(CARD).fg(IVORY));
@@ -763,7 +912,7 @@ fn draw_popup(f: &mut Frame, area: Rect, app: &App, popup: &Popup) {
         Popup::Download(ask) => {
             // The checkout slip: details on the left, an empty DATE DUE field
             // on the right that pressing y stamps.
-            let inner = card(f, area, 60, 13, if ask.is_dir { "download folder" } else { "download" });
+            let inner = card(f, app, area, 60, 13, if ask.is_dir { "download folder" } else { "download" });
             let buf = f.buffer_mut();
             let fw = due_field(buf, inner.right(), inner.y, None);
             let text_w = inner.width.saturating_sub(fw + 2);
@@ -796,14 +945,18 @@ fn draw_popup(f: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                 Line::styled(clip_left(&download::tilde(&ask.target), inner.width as usize), st(IVORY)),
                 inner.width,
             );
-            let mut keys = key_hint("y", "download");
-            keys.push(Span::raw("     "));
-            keys.extend(key_hint("n", "cancel"));
-            put(buf, inner.x, inner.bottom() - 1, Line::from(keys), inner.width);
+            actions(
+                buf,
+                app,
+                inner.x,
+                inner.bottom() - 1,
+                inner.width,
+                &[("y", "download", BRASS), ("n", "cancel", BRASS)],
+            );
         }
         Popup::Transfer(id) => {
             let Some(t) = app.transfers.iter().find(|t| t.id == *id) else { return };
-            let inner = card(f, area, 60, 13, if t.upload { "uploading" } else { "downloading" });
+            let inner = card(f, app, area, 60, 13, if t.upload { "uploading" } else { "downloading" });
             let buf = f.buffer_mut();
             // Only downloads get the date-due stamp.
             let fw = if t.upload { 0 } else { due_field(buf, inner.right(), inner.y, Some(t.stamped)) + 2 };
@@ -862,73 +1015,58 @@ fn draw_popup(f: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                 stats.push_str(&format!("  ·  {}:{:02} left", left / 60, left % 60));
             }
             put(buf, inner.x, inner.y + 6, Line::styled(stats, st(GRAIN)), inner.width);
-            let mut keys = key_hint("c", "cancel");
-            keys.push(Span::raw("     "));
-            keys.extend(key_hint("esc", "hide"));
-            put(buf, inner.x, inner.bottom() - 1, Line::from(keys), inner.width);
+            actions(
+                buf,
+                app,
+                inner.x,
+                inner.bottom() - 1,
+                inner.width,
+                &[("c", "cancel", BRASS), ("esc", "hide", BRASS)],
+            );
         }
-        Popup::Help => {
-            let rows: &[(&str, &[(&str, &str)])] = &[
-                (
-                    "Everywhere",
-                    &[
-                        ("alt+1 2 3", "focus machines, shell, files"),
-                        ("tab", "next pane (outside the shell)"),
-                        ("alt+q", "quit"),
-                    ],
-                ),
-                (
-                    "Machines",
-                    &[
-                        ("j k  /", "move, search"),
-                        ("enter", "connect or switch"),
-                        ("a  e  D", "add, edit, delete machine"),
-                        ("K", "copy your SSH key (no more passwords)"),
-                        ("x", "close session"),
-                        ("r", "reload ssh config"),
-                    ],
-                ),
-                ("Shell", &[("shift+pgup/pgdn", "scroll back"), ("", "every other key goes to the machine")]),
-                (
-                    "Files",
-                    &[
-                        ("j k", "move"),
-                        ("enter l  h  ~", "open folder, go up, home"),
-                        ("d", "download file or folder to ~/Downloads"),
-                        ("u", "upload from this computer"),
-                        (".  r", "show hidden, refresh"),
-                    ],
-                ),
-            ];
-            let h = rows.iter().map(|(_, r)| r.len() + 2).sum::<usize>() as u16 + 5;
-            let inner = card(f, area, 66, h, "keys");
+        Popup::Help(scroll) => draw_help(f, area, app, *scroll),
+        Popup::Preview(p) => draw_preview(f, area, app, p),
+        Popup::Name(p) => draw_name(f, area, app, p),
+        Popup::Forwards(p) => draw_forwards(f, area, app, p),
+        Popup::ConfirmRemove { alias, dir, name, is_dir } => {
+            let inner = card(f, app, area, 62, 11, if *is_dir { "delete folder" } else { "delete" });
             let buf = f.buffer_mut();
-            let mut y = inner.y;
-            for (section, keys) in rows {
-                put(buf, inner.x, y, Line::styled(*section, st(IVORY).add_modifier(Modifier::BOLD)), inner.width);
-                y += 1;
-                for (k, l) in *keys {
-                    put(
-                        buf,
-                        inner.x,
-                        y,
-                        Line::from(vec![
-                            Span::styled(format!("  {k:<18}"), st(BRASS).add_modifier(Modifier::BOLD)),
-                            Span::styled(*l, st(GRAIN)),
-                        ]),
-                        inner.width,
-                    );
-                    y += 1;
-                }
-                y += 1;
-            }
-            let mut close = key_hint("w", "welcome tour");
-            close.push(Span::styled("   any other key closes", meta()));
-            put(buf, inner.x, inner.bottom() - 1, Line::from(close), inner.width);
+            let w = inner.width as usize;
+            let shown = if *is_dir { format!("{}/", safe(name)) } else { safe(name) };
+            put(
+                buf,
+                inner.x,
+                inner.y,
+                Line::from(vec![
+                    Span::styled("Delete ", st(IVORY)),
+                    Span::styled(
+                        clip(&shown, w.saturating_sub(alias.len() + 14)),
+                        st(IVORY).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" on ", st(IVORY)),
+                    Span::styled(alias.clone(), st(tab_for(alias)).add_modifier(Modifier::BOLD)),
+                    Span::styled("?", st(IVORY)),
+                ]),
+                inner.width,
+            );
+            put(
+                buf,
+                inner.x,
+                inner.y + 1,
+                Line::styled(clip_left(&safe(&remote::join(dir, name)), w), meta()),
+                inner.width,
+            );
+            let warn = if *is_dir {
+                "The folder and everything in it is deleted for good."
+            } else {
+                "It's deleted for good; there's no trash on the machine."
+            };
+            put(buf, inner.x, inner.y + 3, Line::styled(warn, st(GRAIN)), inner.width);
+            actions(buf, app, inner.x, inner.bottom() - 1, inner.width, &[("y", "delete", ERR), ("n", "keep", BRASS)]);
         }
         Popup::HostForm(form) => {
             let title = if form.editing.is_some() { "edit machine" } else { "add machine" };
-            let inner = card(f, area, 64, 19, title);
+            let inner = card(f, app, area, 64, 19, title);
             let buf = f.buffer_mut();
             let label_w = 10u16;
             for (i, label) in FORM_LABELS.iter().enumerate() {
@@ -976,15 +1114,17 @@ fn draw_popup(f: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                     inner.width,
                 );
             }
-            let mut keys = key_hint("tab", "next field");
-            keys.push(Span::raw("    "));
-            keys.extend(key_hint("ctrl+s", "save"));
-            keys.push(Span::raw("    "));
-            keys.extend(key_hint("esc", "cancel"));
-            put(buf, inner.x, inner.bottom() - 1, Line::from(keys), inner.width);
+            actions(
+                buf,
+                app,
+                inner.x,
+                inner.bottom() - 1,
+                inner.width,
+                &[("tab", "next field", BRASS), ("ctrl+s", "save", BRASS), ("esc", "cancel", BRASS)],
+            );
         }
         Popup::ConfirmDelete { alias, file } => {
-            let inner = card(f, area, 60, 10, "delete machine");
+            let inner = card(f, app, area, 60, 10, "delete machine");
             let buf = f.buffer_mut();
             put(
                 buf,
@@ -1011,14 +1151,10 @@ fn draw_popup(f: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                 Line::styled("The old file is kept as a .drawer.bak backup.", st(GRAIN)),
                 inner.width,
             );
-            let mut keys =
-                vec![Span::styled("y", st(ERR).add_modifier(Modifier::BOLD)), Span::styled(" delete", st(GRAIN))];
-            keys.push(Span::raw("     "));
-            keys.extend(key_hint("n", "keep"));
-            put(buf, inner.x, inner.bottom() - 1, Line::from(keys), inner.width);
+            actions(buf, app, inner.x, inner.bottom() - 1, inner.width, &[("y", "delete", ERR), ("n", "keep", BRASS)]);
         }
         Popup::CopyKey { alias, key_path, key } => {
-            let inner = card(f, area, 64, 11, "copy key");
+            let inner = card(f, app, area, 64, 11, "copy key");
             let buf = f.buffer_mut();
             put(
                 buf,
@@ -1041,13 +1177,17 @@ fn draw_popup(f: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                 Line::styled("After this, logging in won't ask for a password.", st(GRAIN)),
                 inner.width,
             );
-            let mut keys = key_hint("y", "copy key");
-            keys.push(Span::raw("     "));
-            keys.extend(key_hint("n", "cancel"));
-            put(buf, inner.x, inner.bottom() - 1, Line::from(keys), inner.width);
+            actions(
+                buf,
+                app,
+                inner.x,
+                inner.bottom() - 1,
+                inner.width,
+                &[("y", "copy key", BRASS), ("n", "cancel", BRASS)],
+            );
         }
         Popup::Upload(p) => {
-            let inner = card(f, area, 68, 16, "upload");
+            let inner = card(f, app, area, 68, 16, "upload");
             let buf = f.buffer_mut();
             let w = inner.width as usize;
             put(
@@ -1090,27 +1230,25 @@ fn draw_popup(f: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                     inner.width,
                 );
             }
-            let mut keys = key_hint("tab", "complete");
-            keys.push(Span::raw("     "));
-            keys.extend(key_hint("enter", "upload"));
-            keys.push(Span::raw("     "));
-            keys.extend(key_hint("esc", "cancel"));
-            put(buf, inner.x, inner.bottom() - 1, Line::from(keys), inner.width);
+            actions(
+                buf,
+                app,
+                inner.x,
+                inner.bottom() - 1,
+                inner.width,
+                &[("tab", "complete", BRASS), ("enter", "upload", BRASS), ("esc", "cancel", BRASS)],
+            );
         }
         Popup::ConfirmQuit(n) => {
-            let inner = card(f, area, 48, 8, "quit");
+            let inner = card(f, app, area, 48, 8, "quit");
             let buf = f.buffer_mut();
-            let s = if *n == 1 { "1 session is open." } else { "" };
-            let text = if s.is_empty() { format!("{n} sessions are open.") } else { s.to_string() };
+            let text = if *n == 1 { "1 session is open.".to_string() } else { format!("{n} sessions are open.") };
             put(buf, inner.x, inner.y, Line::styled(text, st(IVORY).add_modifier(Modifier::BOLD)), inner.width);
             put(buf, inner.x, inner.y + 1, Line::styled("Quitting closes them.", st(GRAIN)), inner.width);
-            let mut keys = key_hint("y", "quit");
-            keys.push(Span::raw("     "));
-            keys.extend(key_hint("n", "stay"));
-            put(buf, inner.x, inner.bottom() - 1, Line::from(keys), inner.width);
+            actions(buf, app, inner.x, inner.bottom() - 1, inner.width, &[("y", "quit", BRASS), ("n", "stay", BRASS)]);
         }
         Popup::ConfirmClose(alias) => {
-            let inner = card(f, area, 48, 8, "close session");
+            let inner = card(f, app, area, 48, 8, "close session");
             let buf = f.buffer_mut();
             put(
                 buf,
@@ -1130,10 +1268,408 @@ fn draw_popup(f: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                 Line::styled("Anything running in the shell stops.", st(GRAIN)),
                 inner.width,
             );
-            let mut keys = key_hint("y", "disconnect");
-            keys.push(Span::raw("     "));
-            keys.extend(key_hint("n", "keep"));
-            put(buf, inner.x, inner.bottom() - 1, Line::from(keys), inner.width);
+            actions(
+                buf,
+                app,
+                inner.x,
+                inner.bottom() - 1,
+                inner.width,
+                &[("y", "disconnect", BRASS), ("n", "keep", BRASS)],
+            );
         }
+    }
+}
+
+// --------------------------------------------------------------- help card
+
+const HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Everywhere",
+        &[
+            ("alt+1 2 3", "focus machines, shell, files"),
+            ("tab", "next pane (outside the shell)"),
+            ("alt+z", "zoom the shell to full window"),
+            ("alt+q", "quit"),
+            ("click", "focus a pane, pick a row"),
+            ("double-click", "connect, open, preview"),
+        ],
+    ),
+    (
+        "Machines",
+        &[
+            ("j k  /", "move, search"),
+            ("enter", "connect or switch"),
+            ("a  e  D", "add, edit, delete machine"),
+            ("f", "forward a port through it"),
+            ("K", "copy key: no more passwords"),
+            ("x  r", "close session, reload ssh config"),
+        ],
+    ),
+    (
+        "Shell",
+        &[
+            ("wheel", "scroll back, or the program"),
+            ("alt+pgup pgdn", "scroll back a page"),
+            ("↑ ↓  esc", "scrolled: a line, back to live"),
+            ("drag", "select and copy"),
+            ("double-click", "copy a word (triple: the line)"),
+            ("shift+drag", "your terminal's own selection"),
+            ("", "other keys go to the machine"),
+        ],
+    ),
+    (
+        "Files",
+        &[
+            ("j k  wheel", "move"),
+            ("enter  h  ~", "open or preview, go up, home"),
+            ("d", "download to ~/Downloads"),
+            ("u", "upload from this computer"),
+            ("p", "preview a text file"),
+            ("/  s", "filter, sort by name, date, size"),
+            ("n  R  D", "new folder, rename, delete"),
+            ("y  c", "copy path, cd the shell here"),
+            (".  r", "show hidden, refresh"),
+        ],
+    ),
+];
+
+fn help_rows(sections: &[(&str, &[(&str, &str)])]) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    for (i, (section, keys)) in sections.iter().enumerate() {
+        if i > 0 {
+            rows.push(Line::raw(""));
+        }
+        rows.push(Line::styled(section.to_string(), st(IVORY).add_modifier(Modifier::BOLD)));
+        for (k, l) in *keys {
+            rows.push(Line::from(vec![
+                Span::styled(format!("  {k:<15}"), st(BRASS).add_modifier(Modifier::BOLD)),
+                Span::styled(l.to_string(), st(GRAIN)),
+            ]));
+        }
+    }
+    rows
+}
+
+fn draw_help(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
+    // Two columns when there's room, else one scrolling column.
+    let two = area.width >= 116;
+    let columns: Vec<Vec<Line>> =
+        if two { vec![help_rows(&HELP[..2]), help_rows(&HELP[2..])] } else { vec![help_rows(HELP)] };
+    let tallest = columns.iter().map(Vec::len).max().unwrap_or(0) as u16;
+    let w = if two { 112 } else { 64 };
+    // Border and padding (4), the rows, a blank row, the action row.
+    let inner = card(f, app, area, w, tallest + 6, "keys");
+    let buf = f.buffer_mut();
+    let body_h = inner.height.saturating_sub(2);
+    let scroll = scroll.min(tallest.saturating_sub(body_h));
+    let col_w = if two { (inner.width - 4) / 2 } else { inner.width };
+    for (c, rows) in columns.into_iter().enumerate() {
+        let x = inner.x + c as u16 * (col_w + 4);
+        for (i, line) in rows.into_iter().skip(scroll as usize).take(body_h as usize).enumerate() {
+            put(buf, x, inner.y + i as u16, line, col_w);
+        }
+    }
+    let more = tallest > body_h;
+    let mut hint = vec![("w", "welcome tour", BRASS)];
+    if more {
+        hint.push(("j", "more", BRASS));
+    }
+    actions(buf, app, inner.x, inner.bottom() - 1, inner.width, &hint);
+    let note = Line::styled("any other key closes", meta());
+    let nw = note.width() as u16;
+    if nw + 30 < inner.width {
+        put(buf, inner.right() - nw, inner.bottom() - 1, note, nw);
+    }
+}
+
+// ------------------------------------------------------------ preview card
+
+fn draw_preview(f: &mut Frame, area: Rect, app: &App, p: &Preview) {
+    let w = area.width.saturating_sub(8).clamp(40, 132);
+    let h = area.height.saturating_sub(4).max(10);
+    let inner = card(f, app, area, w, h, "preview");
+    let buf = f.buffer_mut();
+    let tw = inner.width as usize;
+    let hue = tab_for(&p.alias);
+    put(
+        buf,
+        inner.x,
+        inner.y,
+        Line::from(vec![
+            Span::styled(
+                clip(&safe(&p.name), tw.saturating_sub(p.alias.len() + 18)),
+                st(IVORY).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {}", human_size(p.size)), st(GRAIN)),
+            Span::styled("  on  ", meta()),
+            Span::styled(p.alias.clone(), st(hue).add_modifier(Modifier::BOLD)),
+        ]),
+        inner.width,
+    );
+    put(buf, inner.x, inner.y + 1, Line::styled(clip_left(&safe(&p.path), tw), meta()), inner.width);
+    for x in inner.left()..inner.right() {
+        buf[(x, inner.y + 2)].set_symbol("─").set_fg(RULE);
+    }
+    let text = Rect::new(inner.x, inner.y + 3, inner.width, inner.height.saturating_sub(5));
+    p.page.set(text.height as usize);
+    let mut position = None;
+    match &p.body {
+        PreviewBody::Loading => put(buf, text.x, text.y, Line::styled("Reading…", st(GRAIN)), text.width),
+        PreviewBody::Failed(e) => {
+            put(
+                buf,
+                text.x,
+                text.y,
+                Line::styled("Couldn't read this file", st(ERR).add_modifier(Modifier::BOLD)),
+                text.width,
+            );
+            put(buf, text.x, text.y + 1, Line::styled(clip(&safe(e), tw), st(GRAIN)), text.width);
+        }
+        PreviewBody::Binary => {
+            put(
+                buf,
+                text.x,
+                text.y,
+                Line::styled("This looks like a binary file.", st(IVORY).add_modifier(Modifier::BOLD)),
+                text.width,
+            );
+            put(buf, text.x, text.y + 1, Line::styled("Download it with d to open it here.", st(GRAIN)), text.width);
+        }
+        PreviewBody::Text(lines, _) if lines.is_empty() => {
+            put(buf, text.x, text.y, Line::styled("This file is empty.", st(GRAIN)), text.width);
+        }
+        PreviewBody::Text(lines, more) => {
+            let digits = lines.len().to_string().len().max(2);
+            let gutter = digits as u16 + 2;
+            let body_w = text.width.saturating_sub(gutter) as usize;
+            let first = p.scroll.min(lines.len().saturating_sub(1));
+            for (i, line) in lines.iter().enumerate().skip(first).take(text.height as usize) {
+                let y = text.y + (i - first) as u16;
+                put(buf, text.x, y, Line::styled(format!("{:>digits$}", i + 1), meta()), gutter);
+                put(buf, text.x + gutter, y, Line::styled(clip(line, body_w), st(IVORY)), text.width - gutter);
+            }
+            let last = (first + text.height as usize).min(lines.len());
+            let mut pos = format!("{}–{} of {}", first + 1, last, lines.len());
+            if *more {
+                pos = format!("{pos} · first {} of {}", human_size(PREVIEW_LIMIT as u64), human_size(p.size));
+            }
+            position = Some(pos);
+        }
+    }
+    let row = inner.bottom() - 1;
+    actions(
+        buf,
+        app,
+        inner.x,
+        row,
+        inner.width,
+        &[("d", "download", BRASS), ("y", "copy path", BRASS), ("esc", "close", BRASS)],
+    );
+    if let Some(pos) = position {
+        let line = Line::styled(pos, meta());
+        let lw = line.width() as u16;
+        if lw + 50 < inner.width {
+            put(buf, inner.right() - lw, row, line, lw);
+        }
+    }
+}
+
+// --------------------------------------------------------------- name card
+
+fn draw_name(f: &mut Frame, area: Rect, app: &App, p: &NameInput) {
+    let (title, verb) = match &p.op {
+        NameOp::Mkdir => ("new folder", "create"),
+        NameOp::Rename(_) => ("rename", "rename"),
+    };
+    let inner = card(f, app, area, 60, 11, title);
+    let buf = f.buffer_mut();
+    let w = inner.width as usize;
+    let mut head = vec![Span::styled(p.alias.clone(), st(tab_for(&p.alias)).add_modifier(Modifier::BOLD))];
+    head.push(Span::styled(format!(":{}", clip_left(&safe(&p.dir), w.saturating_sub(p.alias.len() + 2))), st(IVORY)));
+    put(buf, inner.x, inner.y, Line::from(head), inner.width);
+    if let NameOp::Rename(old) = &p.op {
+        put(
+            buf,
+            inner.x,
+            inner.y + 1,
+            Line::styled(format!("was {}", clip(&safe(old), w.saturating_sub(4))), meta()),
+            inner.width,
+        );
+    }
+    put(
+        buf,
+        inner.x,
+        inner.y + 3,
+        Line::from(vec![
+            Span::styled(clip_left(&p.input, w.saturating_sub(2)), st(IVORY)),
+            Span::styled("▏", st(BRASS)),
+        ]),
+        inner.width,
+    );
+    for x in inner.left()..inner.right() {
+        buf[(x, inner.y + 4)].set_symbol("─").set_fg(BRASS);
+    }
+    if let Some(e) = &p.error {
+        put(buf, inner.x, inner.y + 5, Line::styled(e.clone(), st(ERR).add_modifier(Modifier::BOLD)), inner.width);
+    }
+    actions(buf, app, inner.x, inner.bottom() - 1, inner.width, &[("enter", verb, BRASS), ("esc", "cancel", BRASS)]);
+}
+
+// ------------------------------------------------------------ forwards card
+
+fn forward_line(fwd: &Forward, sel: bool, focused: bool) -> Line<'static> {
+    let port_style =
+        if sel && focused { st(BRASS).add_modifier(Modifier::BOLD) } else { st(IVORY).add_modifier(Modifier::BOLD) };
+    let quiet = if sel { st(GRAIN) } else { st(FAINT) };
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(format!("localhost:{:<5}", fwd.port()), port_style),
+        Span::styled("  →  ", quiet),
+        Span::styled(fwd.target(), st(GRAIN)),
+    ])
+}
+
+fn draw_forwards(f: &mut Frame, area: Rect, app: &App, p: &Forwards) {
+    let list: Vec<Forward> = app.sessions.get(&p.alias).map(|s| s.forwards.clone()).unwrap_or_default();
+    let rows = list.len().max(1) as u16;
+    let typing = p.input.is_some();
+    let h = 8
+        + rows
+        + if typing {
+            6
+        } else if p.error.is_some() {
+            2
+        } else {
+            0
+        };
+    let inner = card(f, app, area, 66, h, "forward ports");
+    let buf = f.buffer_mut();
+    let hue = tab_for(&p.alias);
+    put(
+        buf,
+        inner.x,
+        inner.y,
+        Line::from(vec![
+            Span::styled("Through  ", st(GRAIN)),
+            Span::styled(p.alias.clone(), st(hue).add_modifier(Modifier::BOLD)),
+            Span::styled("  ·  only this computer can use them", meta()),
+        ]),
+        inner.width,
+    );
+    let top = inner.y + 2;
+    if list.is_empty() {
+        put(buf, inner.x + 1, top, Line::styled("No ports forwarded yet.", st(GRAIN)), inner.width);
+    }
+    for (i, fwd) in list.iter().enumerate() {
+        let y = top + i as u16;
+        let sel = i == p.selected && !typing;
+        if sel {
+            fill(buf, Rect::new(inner.x, y, inner.width, 1), ROW_SEL);
+        }
+        put(buf, inner.x, y, forward_line(fwd, sel, !typing), inner.width);
+    }
+    let y = top + rows + 1;
+    if let Some(input) = &p.input {
+        put(buf, inner.x, y, Line::styled("New forward", st(BRASS).add_modifier(Modifier::BOLD)), inner.width);
+        put(
+            buf,
+            inner.x,
+            y + 1,
+            Line::from(vec![
+                Span::styled(clip_left(input, inner.width.saturating_sub(2) as usize), st(IVORY)),
+                Span::styled("▏", st(BRASS)),
+                Span::styled(if input.is_empty() { "a port, like 3000" } else { "" }, meta()),
+            ]),
+            inner.width,
+        );
+        for x in inner.left()..inner.right() {
+            buf[(x, y + 2)].set_symbol("─").set_fg(BRASS);
+        }
+        // Say in words what the typed spec will do, or why it won't.
+        let explain = match (&p.error, Forward::parse(input)) {
+            (Some(e), _) => Line::styled(clip(&safe(e), inner.width as usize), st(ERR).add_modifier(Modifier::BOLD)),
+            (None, _) if input.trim().is_empty() => Line::raw(""),
+            (None, Ok(Forward::Socks { port })) => Line::from(vec![
+                Span::styled(format!("A SOCKS proxy on localhost:{port} that goes out through "), st(GRAIN)),
+                Span::styled(p.alias.clone(), st(hue)),
+            ]),
+            (None, Ok(fwd)) => Line::from(vec![
+                Span::styled(format!("localhost:{}", fwd.port()), st(IVORY).add_modifier(Modifier::BOLD)),
+                Span::styled(" here reaches ", st(GRAIN)),
+                Span::styled(fwd.target(), st(IVORY).add_modifier(Modifier::BOLD)),
+                Span::styled(" on ", st(GRAIN)),
+                Span::styled(p.alias.clone(), st(hue)),
+            ]),
+            (None, Err(e)) => Line::styled(clip(&e, inner.width as usize), meta()),
+        };
+        put(buf, inner.x, y + 3, explain, inner.width);
+        put(
+            buf,
+            inner.x,
+            y + 4,
+            Line::styled("3000  ·  8080:3000  ·  8080:10.0.0.5:80  ·  socks 1080", meta()),
+            inner.width,
+        );
+        let back = if list.is_empty() { "cancel" } else { "back" };
+        actions(
+            buf,
+            app,
+            inner.x,
+            inner.bottom() - 1,
+            inner.width,
+            &[("enter", "forward", BRASS), ("esc", back, BRASS)],
+        );
+    } else {
+        if let Some(e) = &p.error {
+            put(
+                buf,
+                inner.x,
+                y,
+                Line::styled(clip(&safe(e), inner.width as usize), st(ERR).add_modifier(Modifier::BOLD)),
+                inner.width,
+            );
+        }
+        let can_open = matches!(list.get(p.selected), Some(Forward::Local { .. }));
+        let can_stop = !list.is_empty();
+        actions(
+            buf,
+            app,
+            inner.x,
+            inner.bottom() - 1,
+            inner.width,
+            &[
+                ("n", "new", BRASS),
+                ("o", "open in browser", if can_open { BRASS } else { FAINT }),
+                ("x", "stop", if can_stop { BRASS } else { FAINT }),
+                ("esc", "close", BRASS),
+            ],
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hints_map_to_keys() {
+        assert_eq!(hint_key("enter"), Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(hint_key("alt+z"), Some(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)));
+        assert_eq!(hint_key("alt+pgup"), Some(KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT)));
+        assert_eq!(hint_key("ctrl+s"), Some(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)));
+        assert_eq!(hint_key("D"), Some(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT)));
+        assert_eq!(hint_key("↑↓"), None);
+        assert_eq!(hint_key("wheel"), None);
+    }
+
+    #[test]
+    fn zoom_gives_the_shell_the_window() {
+        let area = Rect::new(0, 0, 160, 40);
+        let normal = layout(area, Focus::Shell, false);
+        assert!(normal.files.is_some() && normal.machines.width > 0);
+        let zoomed = layout(area, Focus::Shell, true);
+        assert_eq!(zoomed.shell, Some(Rect::new(0, 0, 160, 39)));
+        assert!(zoomed.files.is_none());
+        assert_eq!(zoomed.machines.width, 0);
     }
 }

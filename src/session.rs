@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use russh_sftp::client::SftpSession;
 
-use crate::remote::Entry;
+use crate::remote::{Entry, Forward};
 
 pub const SCROLLBACK: usize = 5000;
 
@@ -29,6 +29,35 @@ pub enum State {
     Failed(Option<u32>),
 }
 
+/// How the file list is ordered. Folders always come first.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Sort {
+    #[default]
+    Name,
+    /// Newest first.
+    Modified,
+    /// Largest first.
+    Size,
+}
+
+impl Sort {
+    pub fn next(self) -> Self {
+        match self {
+            Sort::Name => Sort::Modified,
+            Sort::Modified => Sort::Size,
+            Sort::Size => Sort::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Sort::Name => "name",
+            Sort::Modified => "newest",
+            Sort::Size => "largest",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Files {
     pub sftp: Option<Arc<SftpSession>>,
@@ -41,17 +70,52 @@ pub struct Files {
     pub error: Option<String>,
     /// Remember the selected name per directory so `h` lands where you were.
     pub came_from: Option<String>,
+    /// Name to select once the next listing arrives (after rename, new folder).
+    pub pending_select: Option<String>,
+    /// Narrow the list to names containing this (case-insensitive).
+    pub filter: String,
+    /// Typing goes into `filter`.
+    pub filtering: bool,
+    pub sort: Sort,
 }
 
 impl Files {
     pub fn visible(&self) -> Vec<&Entry> {
-        self.entries.iter().filter(|e| self.show_hidden || !e.name.starts_with('.')).collect()
+        let q = self.filter.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|e| self.show_hidden || !e.name.starts_with('.'))
+            .filter(|e| q.is_empty() || e.name.to_lowercase().contains(&q))
+            .collect()
     }
     pub fn hidden_count(&self) -> usize {
         if self.show_hidden { 0 } else { self.entries.iter().filter(|e| e.name.starts_with('.')).count() }
     }
     pub fn current(&self) -> Option<Entry> {
         self.visible().get(self.selected).map(|e| (*e).clone())
+    }
+
+    /// Re-order `entries` for the current sort, folders first.
+    pub fn resort(&mut self) {
+        let by_name =
+            |a: &Entry, b: &Entry| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.name.cmp(&b.name));
+        let sort = self.sort;
+        self.entries.sort_by(|a, b| {
+            b.kind.is_dir().cmp(&a.kind.is_dir()).then_with(|| match sort {
+                Sort::Name => by_name(a, b),
+                Sort::Modified => b.mtime.cmp(&a.mtime).then_with(|| by_name(a, b)),
+                Sort::Size => b.size.cmp(&a.size).then_with(|| by_name(a, b)),
+            })
+        });
+    }
+
+    /// Select the entry called `name` if it is visible, else keep the index in range.
+    pub fn select_name(&mut self, name: Option<&str>) {
+        let vis = self.visible();
+        self.selected = name
+            .and_then(|n| vis.iter().position(|e| e.name == n))
+            .unwrap_or(self.selected)
+            .min(vis.len().saturating_sub(1));
     }
 }
 
@@ -65,9 +129,10 @@ pub struct Session {
     pub control_path: PathBuf,
     pub state: State,
     pub size: (u16, u16),
-    pub scroll: usize,
     pub files: Files,
     pub sftp_starting: bool,
+    /// Port forwards added through this session's control connection.
+    pub forwards: Vec<Forward>,
 }
 
 /// Private directory for control sockets: $XDG_RUNTIME_DIR/drawer, or
@@ -156,9 +221,9 @@ impl Session {
             control_path,
             state: State::Connecting,
             size: (rows, cols),
-            scroll: 0,
             files: Files::default(),
             sftp_starting: false,
+            forwards: Vec::new(),
         })
     }
 
@@ -170,7 +235,7 @@ impl Session {
         if !self.is_live() {
             return;
         }
-        if self.scroll != 0 {
+        if self.scrollback() != 0 {
             self.set_scroll(0);
         }
         let _ = self.writer.write_all(bytes);
@@ -189,11 +254,40 @@ impl Session {
         }
     }
 
+    /// How many lines the view is scrolled back (0 = live). Read from the
+    /// emulator each time: new output while scrolled back moves the offset so
+    /// the text you're reading stays put.
+    pub fn scrollback(&self) -> usize {
+        self.parser.lock().map(|p| p.screen().scrollback()).unwrap_or(0)
+    }
+
     pub fn set_scroll(&mut self, lines: usize) {
         if let Ok(mut p) = self.parser.lock() {
             p.screen_mut().set_scrollback(lines);
-            self.scroll = p.screen().scrollback();
         }
+    }
+
+    /// Scroll back (positive) or toward live (negative), clamped.
+    pub fn scroll_by(&mut self, delta: isize) {
+        let cur = self.scrollback();
+        self.set_scroll(cur.saturating_add_signed(delta));
+    }
+
+    pub fn half_page(&self) -> isize {
+        (self.size.0 / 2).max(1) as isize
+    }
+
+    /// A full-screen program (vim, htop, less) is showing.
+    pub fn alternate_screen(&self) -> bool {
+        self.parser.lock().map(|p| p.screen().alternate_screen()).unwrap_or(false)
+    }
+
+    /// The mouse mode and encoding the remote program asked for.
+    pub fn mouse_mode(&self) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding) {
+        self.parser
+            .lock()
+            .map(|p| (p.screen().mouse_protocol_mode(), p.screen().mouse_protocol_encoding()))
+            .unwrap_or_default()
     }
 
     pub fn app_cursor(&self) -> bool {
@@ -213,6 +307,8 @@ impl Session {
             let code = Some(status.exit_code());
             self.state = if self.state == State::Connected { State::Ended(code) } else { State::Failed(code) };
             self.files.sftp = None;
+            // Forwards live in the master process, so they ended with it.
+            self.forwards.clear();
             return true;
         }
         // OpenSSH only opens the control socket after authentication succeeds.
@@ -232,5 +328,48 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::Kind;
+
+    fn e(name: &str, kind: Kind, size: u64, mtime: i64) -> Entry {
+        Entry { name: name.into(), kind, size, mtime: Some(mtime) }
+    }
+
+    #[test]
+    fn sort_and_filter_keep_folders_first() {
+        let mut f = Files {
+            entries: vec![
+                e("b.log", Kind::File, 10, 300),
+                e("src", Kind::Dir, 0, 100),
+                e("A.txt", Kind::File, 500, 200),
+                e(".env", Kind::File, 1, 400),
+            ],
+            ..Default::default()
+        };
+        f.resort();
+        let names = |f: &Files| f.visible().iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&f), ["src", "A.txt", "b.log"]);
+        f.sort = Sort::Modified;
+        f.resort();
+        assert_eq!(names(&f), ["src", "b.log", "A.txt"]);
+        f.sort = Sort::Size;
+        f.resort();
+        assert_eq!(names(&f), ["src", "A.txt", "b.log"]);
+        f.filter = "LOG".into();
+        assert_eq!(names(&f), ["b.log"]);
+        f.filter.clear();
+        f.show_hidden = true;
+        assert_eq!(f.visible().len(), 4);
+        f.selected = 3;
+        f.select_name(Some("src"));
+        assert_eq!(f.selected, 0);
+        f.filter = "zzz".into();
+        f.select_name(None);
+        assert_eq!(f.selected, 0);
     }
 }

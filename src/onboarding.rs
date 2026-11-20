@@ -375,9 +375,9 @@ fn setup(buf: &mut Buffer, r: Rect, s: &Setup, hosts: &[Host]) {
 fn how(buf: &mut Buffer, r: Rect) {
     // A miniature of the real screen, each pane with its keys.
     let cols: [(&str, &[(&str, &str)]); 3] = [
-        ("machines", &[("enter", "connect"), ("a e D", "add/edit/del"), ("/", "search"), ("K", "copy key")]),
-        ("shell", &[("", "type as usual"), ("", "shift+pgup scrolls"), ("", ""), ("", "")]),
-        ("files", &[("d", "download"), ("u", "upload"), ("h", "go up"), (".", "hidden")]),
+        ("machines", &[("enter", "connect"), ("a e D", "add/edit/del"), ("f", "forward port"), ("K", "copy key")]),
+        ("shell", &[("", "type as usual"), ("", "wheel scrolls back"), ("", "drag to copy"), ("alt+z", "zoom")]),
+        ("files", &[("d", "download"), ("u", "upload"), ("p", "preview"), ("/", "filter")]),
     ];
     let gap = 1u16;
     let pw = (r.width.saturating_sub(gap * 2)) / 3;
@@ -426,7 +426,7 @@ fn how(buf: &mut Buffer, r: Rect) {
         r.x,
         ty + 2,
         Line::styled(
-            "In the shell every key goes to the machine; use alt+1 to get back.",
+            "Keys in the shell go to the machine; alt+1 or a click gets you out.",
             st(FAINT).add_modifier(Modifier::ITALIC),
         ),
         r,
