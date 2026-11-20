@@ -29,11 +29,13 @@ DRAWER_CONFIG=/tmp/test-ssh-config cargo run
 
 | File | What it does |
 |---|---|
-| `src/app.rs` | app state, keys, background tasks |
-| `src/ui.rs` | drawing |
+| `src/app.rs` | app state, keys and mouse, background tasks |
+| `src/ui.rs` | drawing, and the click targets drawn with it |
+| `src/mouse.rs` | mouse reports for remote programs, clicks, text selection |
+| `src/clipboard.rs` | copying to the clipboard (OSC 52 and native tools) |
 | `src/onboarding.rs` | the welcome tour |
 | `src/session.rs` | the `ssh` process in a pseudo-terminal, acting as control master |
-| `src/remote.rs` | SFTP over the control socket, listing, key install |
+| `src/remote.rs` | SFTP over the control socket, file actions, port forwards, key install |
 | `src/transfer.rs` | downloads and uploads |
 | `src/configedit.rs` | safe edits to ssh config files |
 | `src/hosts.rs` | reading `~/.ssh/config` |
@@ -43,7 +45,8 @@ The interface follows [DESIGN.md](DESIGN.md). In short:
 - use only terminal palette colours, never fixed RGB;
 - yellow means "you can press this now";
 - each machine keeps one colour everywhere;
-- no animations.
+- no animations;
+- anything drawn as a key hint should be clickable (use `actions()` in `ui.rs`).
 
 ## Pull requests
 

@@ -172,10 +172,11 @@ Three columns on the terminal background above a one-row key legend.
 - **Files** on the right: 46 col at 150+, 42 at 140-149, 38 at 120-139, 34 at 100-119.
 - **Below 100 col** the files pane replaces the shell while it has focus; only two columns show.
 - **Below 60 × 14** the screen shows a centred "drawer needs a bigger window" notice and nothing else.
+- **Zoom** (`alt+z`) gives the shell the whole body; the machines and files panes are not drawn. Focusing another pane ends the zoom.
 - **Footer** is one row on the terminal background: key hints on the left separated by 3 col, status (toast or transfer) right-aligned. Hints are dropped whole from the end until both fit; never truncated mid-hint.
 - **Drawers** are two rows (alias plus state glyph, then address) with one row of air between, so a 3-row pitch.
 - **Files pane** stacks breadcrumb row, ruled hairline row, list, and a status row at the bottom (`3 items · 1 hidden .`). The date-due stamp column is reserved only in folders that hold a downloaded file, so other folders keep the full name width.
-- **Popups** are centred cards (60 × 13 for download and transfer, 62 wide for help, 48 × 8 for confirms) with 2 col inner side padding and 1 row top and bottom. Actions sit on the bottom row, 5 col apart.
+- **Popups** are centred cards (60 × 13 for download and transfer, 64 wide for help or 112 in two columns from 116 cols, 48 × 8 for confirms, nearly full-screen for preview) with 2 col inner side padding and 1 row top and bottom. Actions sit on the bottom row, 5 col apart.
 
 ## Elevation & Depth
 
@@ -200,7 +201,13 @@ Square box-drawing only. Light single lines (`┌─┐│`) for every border; t
 Two rows on a 3-row pitch. Row 1: `▌` in machine hue, space, bold alias (live yellow when selected and focused), state glyph at the right edge (`●` ok, `◌` default foreground connecting, `✕` err, `○` faint ended). Row 2: `▌` again, address in faint italic (secondary italic when selected), or the held alarm in err. Selection fills both rows with row-selected. A faint count line (`4 machines · 1 open`) closes the pane.
 
 ### Shell Tab
-The shell pane's title is a solid chip in the machine's hue with the alias in bold ansi-0 text, padded 1 col each side, followed by a state word (secondary "connecting", faint "ended", err "couldn't connect") when not connected. Scrollback shows `↑ N lines` in secondary at the right of the top border. A dead session shows a reverse-free bar on the bottom row with the message and `enter`/`x` hints.
+The shell pane's title is a solid chip in the machine's hue with the alias in bold ansi-0 text, padded 1 col each side, followed by a state word (secondary "connecting", faint "ended", err "couldn't connect") when not connected. The right of the top border carries, in secondary, active port forwards (`↔ :8080 :1080`) and, while scrolled back, `↑ N lines`, joined by a faint `·`. A dead session shows a reverse-free bar on the bottom row with the message and `enter`/`x` hints.
+
+### Text Selection
+Mouse-selected shell text takes the selected-row fill (ansi 8) with default-foreground text, replacing the remote colours under it for as long as it is shown. It is a stream selection, like a terminal's: from the start cell to the end of its row, whole rows between, and the end row up to the end cell. A key press or a new click clears it. Copying confirms with an ok toast (`Copied 42 characters`).
+
+### Mouse
+Every key hint drawn in the footer, a popup's action row or the dead-session bar is a click target that presses its key; hints that aren't a single key (`↑↓`, `wheel`) aren't. Rows are click targets for exactly the cells they fill. Click targets are recorded while drawing, so a click always lands on what is on screen. Clicking outside a read-only card (keys, preview) closes it; cards that hold input or ask a question stay open.
 
 ### File Row (catalog card)
 `icon name … stamp size date`. Icon in secondary (Nerd Font folder, file, link glyphs; `/`, space, `@` when `DRAWER_NO_ICONS` is set). Folders get a trailing `/`. Size in secondary, compact (`47K`); date in faint italic. Selected: row-selected fill, name in live yellow when focused.
@@ -227,6 +234,18 @@ Names the machine (in its hue) and the exact file, states that a `.drawer.bak` b
 
 ### Upload Picker
 Destination (`alias:/remote/dir`) on top, a single path field with yellow underline and caret, up to six faint italic completions below, `tab complete · enter upload · esc cancel`.
+
+### Preview Card
+Nearly full-screen card titled `P R E V I E W`: bold file name, size in secondary, "on" in faint italic and the alias in its hue; the remote path in faint italic below; then a rule. Text in the default foreground with faint italic line numbers right-aligned in a gutter. Long lines are clipped with `…`, never wrapped. Bottom row: `d download · y copy path · esc close` on the left and the faint italic position (`41–80 of 200`, plus `first 512 KB of 4.0 MB` when cut short) on the right. Binary files get a two-line note instead of text.
+
+### Name Card
+Used for new folder and rename (`N E W   F O L D E R`, `R E N A M E`): `alias:/folder` with the alias in its hue, `was <old name>` in faint italic when renaming, then one input on a live-yellow underline with a `▏` caret, an error line in red bold, and `enter create|rename · esc cancel`.
+
+### Delete Card
+`D E L E T E` or `D E L E T E   F O L D E R`: names the entry (bold) and the machine (hue), the full remote path in faint italic, and a plain secondary sentence that it can't be undone. The confirming `y` is error red; Enter never confirms.
+
+### Ports Card
+`F O R W A R D   P O R T S`: "Through" and the alias in its hue, with "only this computer can use them" in faint italic. One row per forward, `localhost:8080  →  localhost:3000`, the port bold (live yellow when selected) and the arrow faint; selection uses the row fill. Adding shows "New forward", a single input on a live-yellow underline, and a line that says in words what the typed spec will do (`localhost:8080 here reaches localhost:3000 on lab`) or why it can't, above faint italic examples. Keys that can't act (`o` on a SOCKS proxy, `x` with nothing to stop) drop to faint.
 
 ### Welcome Tour (onboarding, signature)
 A full-screen card shown on first launch (`drawer --welcome` or `w` in help repeats it), three steps with `●○○` progress and `← back · → next · esc skip`:
